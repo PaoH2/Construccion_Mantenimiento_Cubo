@@ -1,126 +1,198 @@
 import polars as pl
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 import os
-from datetime import datetime
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Any
+from datetime import datetime
+import random
 
-# --- CONFIGURACIÓN ---
-# Usaremos SQLite en memoria para simular la conexión.
-DW_CONNECTION_STRING = "sqlite:///data/dss_data_warehouse.db" 
-# NOMBRE DE TABLA SOLICITADO
-AGGREGATION_TABLE_NAME = "MV_OLAP_CUBE_KPIs" 
+# CONFIGURACIÓN
+
+MYSQL_CONNECTION_STR = "mysql+pymysql://root:@127.0.0.1:3306/Gestion_Proyectos"
+
+DW_CONNECTION_STRING = MYSQL_CONNECTION_STR
+AGGREGATION_TABLE_NAME = "mv_olap_cube_kpis" # Minúsculas para compatibilidad MySQL
+
+# Configuración de salida de respaldo (backup)
 OUTPUT_DIR = "data"
 OUTPUT_FILE_BACKUP = "agregaciones_kpis_backup.parquet"
 OUTPUT_PATH_BACKUP = os.path.join(OUTPUT_DIR, OUTPUT_FILE_BACKUP)
 
-# --- SIMULACIÓN DE LA EXTRACCIÓN Y CREACIÓN DEL DATAFRAME BRUTO ---
+def extract_and_transform_data(engine) -> pl.DataFrame:
+    """
+    Realiza la extracción de datos COMPLETOS de la tabla de hechos y dimensiones de MySQL, 
+    y aplica la lógica analítica para calcular los KPIs de EVM/Calidad.
+    """
+    
+    print("2.1. Ejecutando JOIN SQL para Extracción de Datos Brutos...")
+    
+    # Consulta SQL EXPANDIDA para extraer todas las variables clave del modelo dimensional.
+    # Usamos alias en minúsculas y COALESCE para manejar valores NULL/0 en métricas.
+    sql_query = f"""
+        SELECT 
+            -- MÉTRICAS CRÍTICAS DE HECHOS (COALESCE para división segura)
+            COALESCE(T1.Costo_Real, 0.0) AS costo_real, 
+            COALESCE(T1.EV, 0.0) AS ev, 
+            COALESCE(T1.PV, 0.0) AS pv,
+            COALESCE(T1.Horas_Reales, 0.0) AS horas_reales,
+            COALESCE(T1.Horas_Planificadas, 0.0) AS horas_planificadas,
+            COALESCE(T1.SV, 0.0) AS sv_bruto,
+            
+            -- DIMENSIONES CLAVE
+            T3.Anio AS anio,
+            T4.Nombre_Proyecto AS proyecto,
+            T6.Seniority AS perfil, -- Seniority del Empleado
+            T7.Nombre_Tarea AS producto, -- Tarea / Producto
+            
+            -- OTRAS DIMENSIONES RELEVANTES (Para futuros filtros o análisis de causa raíz)
+            T5.Rol AS empleado_rol,
+            T9.Metoddologia_Proyecto AS metodologia,
+            T10.Estado_Proyecto AS estado_proyecto,
+            T11.Tipo_Proyecto AS tipo_proyecto
 
-def create_raw_dss_data() -> pl.DataFrame:
-    """Crea los datos brutos de simulación para KPIs de Desarrollo de Software."""
+        FROM Fact_Gestion_Proyecto T1
+        
+        -- Dimensiones Clave para el Cubo
+        INNER JOIN DimAnio T3 ON T1.ID_Anio = T3.ID_Anio
+        INNER JOIN DimProyecto T4 ON T1.ID_Proyecto = T4.ID_Proyecto
+        INNER JOIN DimEmpleado_Perfil T6 ON T1.ID_Empleado_Perfil = T6.ID_Empleado_Perfil
+        INNER JOIN DimTarea T7 ON T1.ID_Tarea = T7.ID_Tarea
+        
+        -- Dimensiones Adicionales
+        INNER JOIN DimEmpleado_Rol T5 ON T1.ID_Empleado_Rol = T5.ID_Empleado_Rol
+        INNER JOIN Proyecto_Metodologia T9 ON T1.ID_Proyecto_Metodologia = T9.ID_Proyecto_Metodologia
+        INNER JOIN DimProyecto_Estado T10 ON T1.ID_Proyecto_Estado = T10.ID_Proyecto_Estado
+        INNER JOIN DimProyecto_Tipo T11 ON T1.ID_Proyecto_Tipo = T11.ID_Proyecto_Tipo;
+    """
     
-    N = 1000 
-    date_range = pd.to_datetime(pd.date_range(start='2023-01-01', periods=N // 10, freq='W')).repeat(10)
-    if len(date_range) > N:
-        date_range = date_range[:N]
-    
-    df_raw = pl.DataFrame({
-        "project_id": np.random.choice(range(100, 110), N),
-        "region_dim": np.random.choice(["Norte", "Sur", "Centro", "Este"], N),
-        "product_dim": np.random.choice(["Producto A", "Producto B", "Producto C"], N),
-        "completion_date": date_range,
-        "defects_found": np.random.randint(0, 15, N), 
-        "lines_of_code_kloc": np.random.uniform(5, 50, N), 
-        "is_on_time": np.random.choice([0, 1], N, p=[0.3, 0.7]), 
-        "tasks_completed": np.random.randint(1, 5, N) 
-    })
-    
-    print(f"Datos brutos DSS creados. Filas: {df_raw.shape[0]}")
-    return df_raw
+    # 1. EXTRACCIÓN REAL: Polars lee directamente de MySQL
+    try:
+        df_raw = pl.read_database(query=sql_query, connection=engine)
+    except Exception as e:
+        print(f"ERROR DE EXTRACCIÓN: Falló la lectura de MySQL: {e}")
+        return pl.DataFrame()
 
-# --- PROCESAMIENTO ANALÍTICO Y CREACIÓN DEL CUBO BASE ---
+    print(f"2.2. Datos extraídos. Filas: {df_raw.shape[0]}. Calculando KPIs...")
 
-def transform_and_aggregate(df_raw: pl.DataFrame) -> pl.DataFrame:
-    """Aplica la lógica analítica para KPIs de DSS y pre-agrega el Cubo OLAP."""
+    # 2. NORMALIZACIÓN DE COLUMNAS A MINÚSCULAS para consistencia interna (SQL ya las aliasó)
+    df_raw.columns = [c.lower() for c in df_raw.columns]
     
-    print("Aplicando lógica de negocio y agregación (Polars)...")
-    
-    # --- Ingeniería de Características y Cálculo a Nivel de Fila ---
-    df_processed = df_raw.with_columns([
-        pl.col("completion_date").dt.year().alias("Anio"),
-        pl.col("region_dim").alias("Region"),
-        pl.col("product_dim").alias("Producto"),
+    # Casting defensivo: Asegurar que las columnas cruciales sean Float64 para cálculos
+    df_raw = df_raw.with_columns([
+        pl.col("costo_real").cast(pl.Float64),
+        pl.col("ev").cast(pl.Float64),
+        pl.col("pv").cast(pl.Float64),
+    ])
 
-        # KPI de Calidad (Tasa de Defectos por KLOC)
-        # Fórmula: (Defectos Encontrados / Líneas de Código en KLOC)
-        # Esto nos da la densidad de defectos antes de la agregación final.
-        (pl.col("defects_found") / pl.col("lines_of_code_kloc")).alias("Defects_Per_KLOC"),
+    # 3. CÁLCULO DE LOS 4 KPIs (EVM y Calidad) con manejo de división por cero
+    
+    df_transformed = df_raw.with_columns([
+        # CPI (Eficiencia de Costo): EV / Costo Real
+        pl.when(pl.col("costo_real") == 0.0)
+          .then(pl.lit(0.0))
+          .otherwise(pl.col("ev") / pl.col("costo_real"))
+          .alias("cpi_index"),
+        
+        # SPI (Eficiencia de Cronograma): EV / PV
+        pl.when(pl.col("pv") == 0.0)
+          .then(pl.lit(1.0))
+          .otherwise(pl.col("ev") / pl.col("pv"))
+          .alias("spi_index"),
+        
+        # SV (Desviación de Cronograma): EV - PV
+        pl.col("sv_bruto").alias("schedule_variance"), # Usamos el SV pre-calculado de la tabla de hechos
+        
+        # Densidad de Defectos (Simulación de un KPI de Calidad - Usaríamos KLOC real si estuviera disponible)
+        (pl.lit(np.random.rand(df_raw.shape[0]) * 0.15 + 0.05)).alias("densidad_defectos"), 
+        
+        # Horas Reales (Para métricas globales estáticas)
+        pl.col("horas_reales").alias("horas_reales_total"),
+        pl.col("costo_real").alias("costo_real_total"),
     ])
     
-    # --- Agregación (Creación de la Vista Materializada) ---
-    df_cube = df_processed.group_by(["Anio", "Region", "Producto"]).agg([
-        
-        # KPI de Calidad: Tasa de Defectos Promedio
-        # Fórmula: Media(Defects_Per_KLOC) por la dimensión agrupada.
-        pl.mean("Defects_Per_KLOC").alias("Tasa_Defectos_Promedio"),
-        
-        # KPI de Productividad: Porcentaje de Tareas a Tiempo
-        # Fórmula: Media(is_on_time). Como 'is_on_time' es binario (1/0), la media es el porcentaje.
-        pl.mean("is_on_time").alias("Porcentaje_Tareas_A_Tiempo_Promedio"),
-        
-        # Métricas Absolutas
-        pl.sum("tasks_completed").alias("Total_Tareas_Completadas"),
-        pl.sum("defects_found").alias("Total_Defectos_Absoluto")
-    ])
+    # 4. AGREGACIÓN BASE (Vista Materializada)
+    groups = ["anio", "perfil", "proyecto", "producto"] # Grupos al nivel más bajo
     
-    df_cube = df_cube.with_columns(pl.col("Anio").cast(pl.Int32))
-    
-    print(f"  -> Procesamiento y Agregación listos. Filas del Cubo: {df_cube.shape[0]}")
-    return df_cube
+    df_aggregated = df_transformed.group_by(groups).agg([
+        pl.mean("cpi_index").alias("cpi_index_promedio"),
+        pl.mean("spi_index").alias("spi_index_promedio"),
+        pl.sum("schedule_variance").alias("schedule_variance_sum"),
+        pl.mean("densidad_defectos").alias("densidad_defectos_promedio"),
+        
+        # Métricas Globales Adicionales
+        pl.sum("horas_reales_total").alias("horas_reales_sum"),
+        pl.sum("costo_real_total").alias("costo_real_sum"),
+        
+        # Incluir Dimensiones Adicionales para filtros futuros (usando .first() para mantener el valor)
+        pl.col("metodologia").first().alias("metodologia"),
+        pl.col("estado_proyecto").first().alias("estado_proyecto"),
+        pl.col("tipo_proyecto").first().alias("tipo_proyecto"),
+        pl.col("empleado_rol").first().alias("empleado_rol"),
 
-# --- CARGAR EL CUBO EN EL DW COMO TABLA DE AGREGACIÓN ---
+    ])
+
+    # 5. La salida final contiene el cubo materializado con todas las métricas y dimensiones.
+    return df_aggregated
+
 
 def load_cube_to_dw(df_cube: pl.DataFrame, engine):
-    """Guarda el DataFrame final en la Tabla de Agregación (DW) y en un archivo Parquet (Backup)."""
+    """Guarda el DataFrame del cubo OLAP en el DW (MySQL) y en un archivo Parquet."""
     
-    print(f"3a. Guardando Cubo en el DW ({AGGREGATION_TABLE_NAME})...")
-    
-    df_cube_pd = df_cube.to_pandas()
-    # Utiliza 'replace' para asegurar que la tabla siempre se crea/actualiza
-    df_cube_pd.to_sql(
-        name=AGGREGATION_TABLE_NAME, 
-        con=engine, 
-        if_exists='replace', 
-        index=False
-    )
-    print(f"  -> Carga exitosa en DW.")
-
-    print(f"3b. Guardando Cubo como archivo de lectura rápida ({OUTPUT_FILE_BACKUP})...")
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
-        
-    df_cube.write_parquet(OUTPUT_PATH_BACKUP)
-    print(f"  -> Archivo Parquet generado en {OUTPUT_PATH_BACKUP}.")
 
-# --- FUNCIÓN PRINCIPAL ---
+    # 1. Eliminación de tabla antigua (Solución para if_exists)
+    print("3a. Eliminando tabla antigua...")
+    try:
+        with engine.connect() as connection:
+            connection.execute(text(f"DROP TABLE IF EXISTS {AGGREGATION_TABLE_NAME}"))
+            connection.commit()
+        print("   -> Tabla antigua eliminada.")
+    except Exception as e:
+        print(f"   -> ERROR al intentar eliminar la tabla: {e}")
+
+    # 2. GUARDAR EN EL DW (VISTA MATERIALIZADA)
+    print("3b. Guardando Cubo en el DW (MV_OLAP_CUBE_KPIs)...")
+    try:
+        df_cube.write_database(
+            table_name=AGGREGATION_TABLE_NAME, 
+            connection=engine 
+        )
+        print("   -> Carga exitosa en DW.")
+    except Exception as e:
+        print(f"   -> ERROR al guardar en DW: {e}")
+
+    # 3. GUARDAR EN PARQUET (RESPALDO / Lectura Rápida)
+    print("3c. Guardando Cubo como archivo de lectura rápida (agregaciones_kpis_backup.parquet)...")
+    try:
+        df_cube.write_parquet(OUTPUT_PATH_BACKUP)
+        print(f"   -> Archivo Parquet generado en {OUTPUT_PATH_BACKUP}.")
+    except Exception as e:
+        print(f"   -> ERROR al guardar en Parquet: {e}")
+
 
 def run_processor():
-    """Ejecuta la pipeline completa de ETL/ELT para el Cubo OLAP."""
-    
-    print(f"\n===== INICIO PROCESADOR OLAP DSS: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} =====")
+    """Ejecuta el flujo completo de ETL/ELT."""
+    print(f"\n INICIO PROCESADOR OLAP: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     try:
-        engine = create_engine(DW_CONNECTION_STRING) 
-
-        raw_data = create_raw_dss_data()
-        cube_data = transform_and_aggregate(raw_data)
-        load_cube_to_dw(cube_data, engine)
-        
-        print("\n===== PROCESAMIENTO OLAP DSS FINALIZADO CON ÉXITO. =====")
-        
+        db_engine = create_engine(MYSQL_CONNECTION_STR)
     except Exception as e:
-        print(f"\nFATAL ERROR en el procesador: {e}")
-        
+        print(f"ERROR: No se pudo crear la conexión a la DB: {e}")
+        return
+
+    print("2. Aplicando lógica de negocio y agregación (Polars)...")
+    df_cube = extract_and_transform_data(db_engine)
+    
+    if df_cube.is_empty():
+         print("PROCESAMIENTO ABORTADO: No se extrajeron datos de MySQL.")
+         return
+
+    print(f"   -> Procesamiento y Agregación listos. Filas del Cubo: {df_cube.shape[0]}")
+    
+    load_cube_to_dw(df_cube, db_engine)
+    
+    print(" PROCESAMIENTO OLAP FINALIZADO CON ÉXITO.\n")
+
 if __name__ == "__main__":
     run_processor()

@@ -1,142 +1,129 @@
-from fastapi import FastAPI, HTTPException, Header, Query
-from pydantic import BaseModel
-import numpy as np
 import polars as pl
+from fastapi import FastAPI, HTTPException, APIRouter, Query, Header
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine
-from typing import Optional, List, Dict, Any
+import numpy as np
+import unicodedata 
+from typing import List, Optional, Dict, Any
 
 # --- Importar la clase del Cubo OLAP ---
-# Se asume que el archivo olap_cube.py está en la carpeta models/
-from models.olap_cube import OlapCube 
+from models.olap_cube import OlapCube
 
 # --- TOKENS Y CONFIGURACIÓN ---
+# Nota: DSS_ACCESS_TOKEN se usa para el Dashboard. PROJECT_LEAD_TOKEN se mantiene si el otro equipo lo requiere.
 DSS_ACCESS_TOKEN = "Bearer DSS-Access-Token"
 PROJECT_LEAD_TOKEN = "Bearer Project-Lead-Token"
 
-DW_CONNECTION_STRING = "sqlite:///data/dss_data_warehouse.db" 
-# 🚨 CORRECCIÓN CLAVE: Usar el nuevo nombre de la tabla DSS
-AGGREGATION_TABLE_NAME = "MV_OLAP_CUBE_KPIs" 
+DW_CONNECTION_STRING = "mysql+pymysql://root:@127.0.0.1:3306/Gestion_Proyectos"
+AGGREGATION_TABLE_NAME = "MV_OLAP_CUBE_KPIs"
+DSS_ACCESS_TOKEN = "Bearer DSS-Access-Token"
 
-# INICIALIZACIÓN DE VARIABLES GLOBALES Y FRAMEWORK
+# Definición de las dimensiones disponibles (Sin 'region')
+AVAILABLE_DIMENSIONS = ["anio", "producto", "proyecto"]
 
-olap_cube_instance: Optional[OlapCube] = None 
+# Inicialización del caché del cubo OLAP (Polars DataFrame)
+olap_cube_df: pl.DataFrame = pl.DataFrame()
 
 app = FastAPI(
-    title="DSS - Capa Analítica",
-    description="Endpoints para Cubo OLAP y Modelo Predictivo. (Arquitectura de Microservicio Ligero)"
+    title="DSS Gestión de Proyectos API",
+    description="Capa Analítica para el Dashboard de Gestión de Proyectos (EVM)."
+)
+router = APIRouter(prefix="/api/olap")
+
+# Configuración CORS para que Streamlit (puerto 8501) pueda acceder a FastAPI (puerto 8000)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:8501", "http://127.0.0.1:8501"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# LÓGICA DE CARGA DE DATOS DESDE EL DW (STARTUP)
-
-@app.on_event("startup")
-async def load_data_from_dw():
-    global olap_cube_instance
-    
-    print(f"INFO: Conectando a DW y cargando tabla {AGGREGATION_TABLE_NAME}...")
-    
+def load_olap_cube():
+    """Carga la Vista Materializada del Cubo OLAP desde MySQL al inicio de la API."""
+    global olap_cube_df
+    print("INFO: Conectando a DW y cargando tabla MV_OLAP_CUBE_KPIs...")
     try:
         engine = create_engine(DW_CONNECTION_STRING)
-        query = f"SELECT * FROM {AGGREGATION_TABLE_NAME}"
+        olap_cube_df = pl.read_database(query=f"SELECT * FROM {AGGREGATION_TABLE_NAME}", connection=engine)
         
-        # Cargar los datos brutos en un DataFrame de Polars
-        raw_df = pl.read_database(query=query, connection=engine)
+        # NORMALIZACIÓN DE COLUMNAS A MINÚSCULAS PARA CONSISTENCIA INTERNA
+        olap_cube_df.columns = [c.lower() for c in olap_cube_df.columns]
         
-        # INSTANCIAR LA CLASE OLAP CON EL DATAFRAME CARGADO
-        olap_cube_instance = OlapCube(raw_df)
-        
-        print(f"INFO: Cubo OLAP base cargado. Filas: {raw_df.shape[0]}. Instancia lista.")
+        print(f"INFO: Cubo OLAP base cargado. Filas: {olap_cube_df.shape[0]}. Instancia lista.")
         
     except Exception as e:
         print(f"ERROR: Fallo la carga inicial del Cubo desde el DW. Detalle: {e}")
-        olap_cube_instance = None # Deja la instancia como None si falla
+        olap_cube_df = pl.DataFrame()
 
-
-# ====================================================================
-# 3. MODELOS Y LÓGICA DE PREDICCIÓN (Rayleigh)
-# ====================================================================
-
-class PredictionInput(BaseModel):
-    lineas_de_codigo_kloc: float
-    complejidad_media: float
-    esfuerzo_persona_mes: float
-    sigma_rayleigh: Optional[float] = 1.5
-    factor_base_defectos: Optional[float] = 0.005
-    
-def predict_rayleigh(data: PredictionInput) -> dict:
-    # Lógica del modelo Rayleigh
-    riesgo_combinado = (data.complejidad_media * data.esfuerzo_persona_mes) / 100 
-    n_base = data.lineas_de_codigo_kloc * data.factor_base_defectos
-    
-    # Modelo simplificado: D_total = D_base * (1 + (riesgo_combinado / sigma)^2)
-    n_total_predicho = n_base * (1 + (riesgo_combinado / data.sigma_rayleigh)**2)
-    
-    defects_total = int(np.round(n_total_predicho))
-    defects_fase_final = int(np.round(n_total_predicho * 0.3)) # Asumiendo 30% de defectos en fase final
-    return {
-        "n_total_predicho": defects_total,
-        "n_en_fase_final": defects_fase_final,
-        "lineas_de_codigo_kloc": data.lineas_de_codigo_kloc,
-        "estimacion_base_defectos": n_base,
-        "modelo_usado": "Distribucion_Rayleigh_Simplificada"
-    }
-
+@app.on_event("startup")
+async def startup_event():
+    """Evento que se ejecuta al iniciar la aplicación."""
+    load_olap_cube()
 
 # ====================================================================
-# 4. ENDPOINTS DE LA API
+# ENDPOINTS
 # ====================================================================
 
-@app.post("/api/dss/defect_prediction")
-def create_defect_prediction(
-    input_data: PredictionInput, 
-    authorization: Optional[str] = Header(None) 
-):
-    if authorization != PROJECT_LEAD_TOKEN:
-        raise HTTPException(status_code=403, detail="Acceso Denegado.")
-    try:
-        resultado = predict_rayleigh(input_data)
-        return resultado
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al ejecutar el modelo de predicción: {str(e)}")
+@router.get("/dimensions")
+def get_dimensions():
+    """Devuelve la lista de dimensiones disponibles."""
+    # Retorna las claves de jerarquía que el frontend puede usar (ej., 'Anio', 'Proyecto')
+    return {"dimensions": list(OlapCube.HIERARCHY_MAP.keys())}
 
-
-@app.get("/api/olap/query", response_model=List[Dict[str, Any]])
-def olap_query(
-    authorization: Optional[str] = Header(None), 
-    region: Optional[str] = Query(None, description="Filtra por una región específica."),
+@router.get("/query")
+def query_olap_cube(
+    group_by_dimension: str = Query("Proyecto", description="Dimensión para agrupar (Drill-Down)."), 
+    kpi_metric: str = Query("cpi_index_promedio", description="Métrica de KPI a mostrar."),
+    authorization: Optional[str] = Header(None),
+    # Quitamos el parámetro 'region'
     anio: Optional[int] = Query(None, description="Filtra por un año específico."),
     producto: Optional[str] = Query(None, description="Filtra por un producto específico."),
-    group_by_dimension: str = Query(..., description="Dimensión o Jerarquía para agrupar (ej. Anio_Region).") 
+    proyecto: Optional[str] = Query(None, description="Filtra por un proyecto específico."),
 ):
     """
-    Simula operaciones OLAP (Slice, Dice, Drill-Down) llamando al método de la clase OlapCube.
+    Permite consultar el cubo OLAP agrupando por una dimensión y calculando KPIs.
     """
     
-    if authorization not in [DSS_ACCESS_TOKEN, PROJECT_LEAD_TOKEN]: # Permitir ambos tokens
+    # 1. AUTENTICACIÓN
+    if authorization != DSS_ACCESS_TOKEN:
         raise HTTPException(status_code=403, detail="Acceso Denegado.")
     
-    # Uso de la instancia de la clase OlapCube
-    if olap_cube_instance is None:
-        # 503 Service Unavailable (Temporalmente no disponible)
-        raise HTTPException(status_code=503, detail="Servicio no disponible. El Cubo OLAP no está cargado.")
+    if olap_cube_df.is_empty():
+        raise HTTPException(
+            status_code=503,
+            detail="Servicio no disponible. El cubo OLAP no está cargado."
+        )
 
+    # 2. LIMPIEZA Y VALIDACIÓN DE LA DIMENSIÓN RECIBIDA
+    cleaned_dimension = unicodedata.normalize('NFKD', group_by_dimension).strip()
+
+    # 3. USO DE LA CLASE OLAPCUBE
     try:
-        # Llamamos al método query del objeto OlapCube, que maneja Slice, Dice y Drill-Down
-        df_result = olap_cube_instance.olap_query(
-            group_by_dimension=group_by_dimension,
-            region=region,
+        # La clase OlapCube asume que el DF ya está en minúsculas
+        cube_instance = OlapCube(olap_cube_df)
+        
+        # La validación de la jerarquía ocurre dentro del método olap_query de la clase
+        df_result = cube_instance.olap_query(
+            group_by_dimension=cleaned_dimension,
+            # Quitamos el parámetro region en el llamado
             anio=anio,
-            producto=producto
+            producto=producto,
+            proyecto=proyecto
         )
         
+        # 4. TRADUCCIÓN DE RESULTADO Y RESPUESTA
         if df_result.is_empty():
-            # 404 Not Found (No hay datos para esta combinación de filtros)
-            raise HTTPException(status_code=404, detail="No se encontraron datos para los filtros aplicados.")
+            raise HTTPException(status_code=404, detail="No se encontraron datos.")
             
-        # Convertir el resultado de Polars a lista de diccionarios (formato JSON estándar)
+        # Retornar el DataFrame de Polars como una lista de diccionarios (JSON)
         return df_result.to_dicts()
 
     except ValueError as e:
         # Captura el error de 'Jerarquía inválida' de OlapCube
-        raise HTTPException(status_code=400, detail=f"Parámetro de consulta inválido: {str(e)}") 
+        raise HTTPException(status_code=400, detail=f"Parámetro Inválido: {e}") 
     except Exception as e:
+        # Captura errores internos de Polars (KeyError, etc.)
         raise HTTPException(status_code=500, detail=f"Error interno al procesar la consulta OLAP: {e}")
+
+app.include_router(router)

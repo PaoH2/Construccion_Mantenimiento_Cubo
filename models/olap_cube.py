@@ -1,75 +1,80 @@
 import polars as pl
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional
 
 class OlapCube:
     """
-    Clase que encapsula el DataFrame de Polars pre-agregado (el Cubo OLAP) 
-    y proporciona métodos para realizar consultas analíticas (Slice, Dice, Drill-Down)
-    incluyendo agrupaciones compuestas, ALINEADA A KPIs DE DESARROLLO DE SOFTWARE.
+    Clase que encapsula el DataFrame de Polars pre-agregado (el Cubo OLAP).
+    Define la lógica de negocio (Jerarquías y Agregaciones) para los KPIs de EVM.
+    
+    ASUME que las columnas del DataFrame están en minúsculas (ej. 'proyecto').
     """
     
-    # --- DIMENSIONES Y JERARQUÍAS ---
-    BASE_DIMENSIONS = ["Region", "Anio", "Producto"]
-    
-    HIERARCHIES = {
-        "Anio_Region": ["Anio", "Region"],
-        "Region_Producto": ["Region", "Producto"]
+    # DEFINICIÓN DE LAS JERARQUÍAS DISPONIBLES (Sin Región)
+    # Clave (PascalCase, lo que el usuario/URL envía) -> Valor (minúscula, lo que Polars necesita)
+    HIERARCHY_MAP = {
+        "Anio": ["anio"],
+        "Producto": ["producto"],
+        "Proyecto": ["proyecto"],
+        "Anio_Producto": ["anio", "producto"],
+        "Proyecto_Anio": ["proyecto", "anio"],
     }
-
-    # Todas las opciones válidas para el usuario (dashboard)
-    VALID_GROUPINGS = BASE_DIMENSIONS + list(HIERARCHIES.keys())
     
-    # CORRECCIÓN: Sustitución de KPIs de Ventas por KPIs de DSS 
-    # Estos nombres DEBEN COINCIDIR con las columnas generadas en el olap_processor.py
-    VALID_MEASURES = [
-        # KPI de Calidad (Tasa de Defectos por KLOC) - Se promedia el promedio para el Roll-up
-        pl.mean("Tasa_Defectos_Promedio").alias("Tasa_Defectos_Promedio"),
-        
-        # KPI de Productividad (% de Tareas a Tiempo) - Se promedia el promedio para el Roll-up
-        pl.mean("Porcentaje_Tareas_A_Tiempo_Promedio").alias("Porcentaje_Tareas_A_Tiempo_Promedio"),
-        
-        # Métricas Absolutas - Se suma el total para el Roll-up
-        pl.sum("Total_Tareas_Completadas").alias("Total_Tareas_Completadas"),
-        pl.sum("Total_Defectos_Absoluto").alias("Total_Defectos_Absoluto")
+    # Medidas válidas para la agregación (KPIs de EVM y Calidad)
+    VALID_MEASURES_NAMES = [
+        "cpi_index_promedio", 
+        "spi_index_promedio",
+        "schedule_variance_sum",
+        "densidad_defectos_promedio"
     ]
     
-    # --- CONSTRUCTOR ---
-    
     def __init__(self, data_frame: pl.DataFrame):
+        """Inicializa la clase con el DataFrame de Polars cargado en memoria."""
         if data_frame.is_empty():
             raise ValueError("El DataFrame del cubo no puede estar vacío.")
         self.df_base = data_frame
         
-    # --- FUNCIÓN DE CONSULTA OLAP (No necesita cambios funcionales) ---
-        
     def olap_query(
         self,
         group_by_dimension: str,
-        region: Optional[str] = None,
+        # Filtros de dimensión (Region fue eliminada)
         anio: Optional[int] = None,
         producto: Optional[str] = None,
+        proyecto: Optional[str] = None,
     ) -> pl.DataFrame:
+        """
+        Ejecuta operaciones OLAP con filtros (Slice/Dice) y agrupamiento (Drill-Down).
+        """
         
-        # Validación de la Dimensión de Agrupación
-        if group_by_dimension not in self.VALID_GROUPINGS:
-            raise ValueError(f"Dimensión de agrupación inválida. Use una de: {self.VALID_GROUPINGS}")
+        # Hardening: Limpieza de la dimensión recibida (elimina caracteres invisibles)
+        cleaned_dimension = group_by_dimension.strip().replace('\ufeff', '').replace('\xa0', '')
+        
+        # 1. VERIFICAR Y RESOLVER LA JERARQUÍA
+        if cleaned_dimension not in self.HIERARCHY_MAP:
+            raise ValueError(f"Jerarquía de agrupación inválida. Use una de: {list(self.HIERARCHY_MAP.keys())}")
+            
+        groups = self.HIERARCHY_MAP[cleaned_dimension]
 
-        # Determinación de la(s) columna(s) real(es) para Polars
-        if group_by_dimension in self.HIERARCHIES:
-            group_cols = self.HIERARCHIES[group_by_dimension]
-        else:
-            group_cols = group_by_dimension
-        
-        # Filtrado (SLICE y DICE)
+        # 2. Clonar y Pre-procesar (CASTING DE TIPOS)
         df = self.df_base.clone()
+        
+        # Corrección de Tipo: Forzar las columnas KPI a Float64 antes de la agregación
+        try:
+            df = df.with_columns([
+                pl.col(kpi).cast(pl.Float64) for kpi in self.VALID_MEASURES_NAMES
+            ])
+        except pl.ColumnNotFoundError as e:
+             # Este error no debería ocurrir si el procesador guardó las columnas correctamente
+             raise ValueError(f"Error interno: Columna KPI no encontrada ({e}). Revise el procesador OLAP.")
+
+        # 3. Aplicar Filtros (SLICE y DICE) - Usamos nombres de columna en minúscula
         filter_conditions = []
         
-        if region:
-            filter_conditions.append(pl.col("Region") == region)
         if anio:
-            filter_conditions.append(pl.col("Anio") == anio)
+            filter_conditions.append(pl.col("anio") == anio)
         if producto:
-            filter_conditions.append(pl.col("Producto") == producto)
+            filter_conditions.append(pl.col("producto") == producto)
+        if proyecto:
+            filter_conditions.append(pl.col("proyecto") == proyecto)
 
         if filter_conditions:
             combined_filter = filter_conditions[0]
@@ -77,8 +82,14 @@ class OlapCube:
                 combined_filter = combined_filter & condition
             df = df.filter(combined_filter)
 
-        # Agregación (DRILL-DOWN)
-        # Se re-agregan los promedios y totales sobre las nuevas columnas de agrupación
-        df_result = df.group_by(group_cols).agg(self.VALID_MEASURES).sort(group_cols)
+        # 4. Definir y Realizar Agregación (DRILL-DOWN y ROLL-UP)
+        aggregations = [
+            pl.mean("cpi_index_promedio").alias("cpi_index_promedio"),
+            pl.mean("spi_index_promedio").alias("spi_index_promedio"),
+            pl.sum("schedule_variance_sum").alias("schedule_variance_sum"), 
+            pl.mean("densidad_defectos_promedio").alias("densidad_defectos_promedio"),
+        ]
+        
+        df_result = df.group_by(groups).agg(aggregations).sort(groups)
         
         return df_result
